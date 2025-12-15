@@ -1,0 +1,82 @@
+{
+    "name": "Mnist_LeNet",
+    "n_gpu": 1,
+    "arch": {
+        "type": "ENSS",
+        "args": {
+            "in_channels_rgb": 3,
+            "in_channels_depth": 1,
+            "in_channels_motion": 2,
+            "upscale_factor": 2,
+            "base_channels": 32,
+            "use_depth": true,
+            "use_motion": true,
+            "use_prev_state": true,
+            "has_bias_in_kernel_prediction": true
+        }
+    },
+    "data_loader": {
+        "type": "GamingSupersampleDataLoader",
+        "args": {
+            "root": "/content/drive/MyDrive/ENSS/data/QRISP/FloodedGrounds",
+            "split": "train",
+            "upscale_factor": 2,
+            "use_jitter": true,
+            "batch_size": 4,
+            "shuffle": true,
+            "validation_split": 0.0,
+            "num_workers": 4,
+            "random_horizontal_flip": true,
+            "random_vertical_flip": true,
+            "color_jitter": 0.2,
+            "random_rotation": 10,
+            "random_crop_size": 256,
+            "data_dir": "/content/drive/MyDrive/ENSS/data/QRISP/FloodedGrounds"
+        }
+    },
+    "validation": {
+        "type": "GamingSupersampleDataLoader",
+        "args": {
+            "root": "/content/drive/MyDrive/ENSS/data/QRISP/FloodedGrounds",
+            "split": "val",
+            "upscale_factor": 2,
+            "use_jitter": true,
+            "batch_size": 4,
+            "shuffle": false,
+            "validation_split": 0.0,
+            "num_workers": 4,
+            "random_horizontal_flip": true,
+            "random_vertical_flip": true,
+            "color_jitter": 0.2,
+            "random_rotation": 10,
+            "random_crop_size": 256,
+            "data_dir": "/content/drive/MyDrive/ENSS/data/QRISP/FloodedGrounds"
+        }
+    },
+    "optimizer": {
+        "type": "Adam",
+        "args": {
+            "lr": 0.0001,
+            "weight_decay": 0,
+            "amsgrad": true
+        }
+    },
+    "loss": "l1_loss",
+    "metrics": [],
+    "lr_scheduler": {
+        "type": "StepLR",
+        "args": {
+            "step_size": 20,
+            "gamma": 0.5
+        }
+    },
+    "trainer": {
+        "epochs": 100,
+        "save_dir": "saved/",
+        "save_period": 1,
+        "verbosity": 2,
+        "monitor": "min val_loss",
+        "early_stop": 10,
+        "tensorboard": true
+    }
+}
