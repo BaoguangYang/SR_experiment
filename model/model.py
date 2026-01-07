@@ -1,284 +1,27 @@
+import os
+os.environ['OPENCV_IO_ENABLE_OPENEXR'] = "1"
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from base import BaseModel
-from model.modules import DepthToSpace, SpaceToDepth
-from utils import warp, retrieve_elements_from_indices
-
-
-def conv_block(in_ch, out_ch, k=3, s=1, p=1):
-    return nn.Sequential(
-        nn.Conv2d(in_ch, out_ch, kernel_size=k, stride=s, padding=p),
-        nn.ReLU(inplace=True),
-        nn.Conv2d(out_ch, out_ch, kernel_size=k, stride=1, padding=p),
-        nn.ReLU(inplace=True),
-    )
-
-
-class ENSS(BaseModel):
-    """
-    Approximate implementation of the ENSS network from:
-      'Efficient Neural Supersampling on a Novel Gaming Dataset' (Mercier et al., ICCV 2023)
-
-    Design choices:
-      - Work in a space-to-depth (subpixel) domain via SpaceToDepth/DepthToSpace.
-      - Keep a recurrent hidden state in subpixel (low-res) space.
-      - Use utils.warp(hidden, motion) for temporal reprojection:
-          * motion is assumed to be in NORMALIZED grid coordinates
-            (same convention as F.grid_sample: [-1, 1] range).
-          * This matches utils.warp, which constructs a base grid and adds motion.
-      - Reconstruct high-res RGB via DepthToSpace.
-    """
-
-    def __init__(
-        self,
-        in_channels_rgb=3,
-        in_channels_depth=1,
-        in_channels_motion=2,
-        upscale_factor=2,
-        base_channels=32,
-        use_depth=True,
-        use_motion=True,
-        use_prev_state=True,
-    ):
-        super().__init__()
-
-        self.upscale_factor = upscale_factor
-        self.use_depth = use_depth
-        self.use_motion = use_motion
-        self.use_prev_state = use_prev_state
-
-        # Space<->Depth modules (wrapper around depth_to_space / space_to_depth)
-        self.s2d = SpaceToDepth(block_size=upscale_factor)
-        self.d2s = DepthToSpace(block_size=upscale_factor)
-
-        # ------------------------------------------------------------------
-        # Channels in space-to-depth domain
-        # ------------------------------------------------------------------
-        sf = upscale_factor
-
-        # RGB in S2D domain
-        in_ch = in_channels_rgb * (sf ** 2)
-
-        # Depth in S2D domain
-        if self.use_depth:
-            self.depth_channels_s2d = in_channels_depth * (sf ** 2)
-            in_ch += self.depth_channels_s2d
-        else:
-            self.depth_channels_s2d = 0
-
-        # Motion in S2D domain (if you choose to concatenate it)
-        if self.use_motion:
-            self.motion_channels_s2d = in_channels_motion * (sf ** 2)
-            in_ch += self.motion_channels_s2d
-        else:
-            self.motion_channels_s2d = 0
-
-        # Recurrent hidden state (in S2D resolution)
-        self.hidden_channels = base_channels
-        if self.use_prev_state:
-            in_ch += self.hidden_channels
-
-        # ------------------------------------------------------------------
-        # Encoder
-        # ------------------------------------------------------------------
-        self.enc1 = conv_block(in_ch, base_channels)             # H/sf,     W/sf
-        self.enc2 = conv_block(base_channels, base_channels * 2) # H/(2sf),  W/(2sf)
-        self.enc3 = conv_block(base_channels * 2, base_channels * 4)
-
-        # ------------------------------------------------------------------
-        # Bottleneck
-        # ------------------------------------------------------------------
-        self.bottleneck = conv_block(base_channels * 4, base_channels * 4)
-
-        # ------------------------------------------------------------------
-        # Decoder (UNet-like)
-        # ------------------------------------------------------------------
-        self.dec3 = conv_block(base_channels * 4 + base_channels * 4,
-                               base_channels * 2)
-        self.dec2 = conv_block(base_channels * 2 + base_channels * 2,
-                               base_channels)
-        self.dec1 = conv_block(base_channels + base_channels,
-                               base_channels)
-
-        # ------------------------------------------------------------------
-        # Output projection in space-to-depth domain
-        # ------------------------------------------------------------------
-        # Output is (B, 3*sf^2, H/sf, W/sf) -> DepthToSpace -> (B, 3, H*sf, W*sf)
-        self.to_out = nn.Conv2d(
-            base_channels,
-            in_channels_rgb * (sf ** 2),
-            kernel_size=3,
-            padding=1,
-        )
-
-        # Bottleneck -> recurrent hidden state (S2D resolution)
-        self.to_hidden = nn.Conv2d(
-            base_channels * 4,
-            self.hidden_channels,
-            kernel_size=1,
-        )
-
-        # Internal recurrent state (space-to-depth resolution)
-        self._hidden_state = None
-
-    # ----------------------------------------------------------------------
-    # State management
-    # ----------------------------------------------------------------------
-    def reset_state(self):
-        """Reset recurrent hidden state; call at the start of a new sequence."""
-        self._hidden_state = None
-
-    # ----------------------------------------------------------------------
-    # Temporal warping in space-to-depth domain
-    # ----------------------------------------------------------------------
-    def _warp_hidden(self, motion: torch.Tensor) -> torch.Tensor | None:
-        """
-        Warp previous hidden state using utils.warp(hidden, motion).
-
-        Assumptions:
-          - self._hidden_state has shape (B, C_h, H_s2d, W_s2d)
-          - motion is (B, 2, H, W) in NORMALIZED grid coordinates
-            (the same convention as F.grid_sample: [-1, 1] range)
-          - utils.warp constructs a base [-1, 1] grid and adds 'motion',
-            so motion is *displacement* in normalized space.
-
-        Implementation details:
-          - We resize motion from (H, W) -> (H_s2d, W_s2d) via bilinear
-            interpolation, which is standard for optical-flow-like fields.
-          - We do NOT clamp motion; out-of-range coords follow utils.warp
-            behaviour (grid_sample padding_mode='zeros').
-        """
-        if self._hidden_state is None:
-            return None
-
-        B, C_h, H_s2d, W_s2d = self._hidden_state.shape
-
-        # Resize motion to match hidden resolution (S2D)
-        motion_s2d = F.interpolate(
-            motion,
-            size=(H_s2d, W_s2d),
-            mode="bilinear",
-            align_corners=True,  # IMPORTANT: match utils.warp / grid_sample
-        )
-
-        # warp(hidden, motion_s2d) -> (B, C_h, H_s2d, W_s2d)
-        warped = warp(self._hidden_state, motion_s2d)
-        return warped
-
-    # ----------------------------------------------------------------------
-    # Forward
-    # ----------------------------------------------------------------------
-    def forward(self, x, depth=None, motion=None, jitter=None):
-        """
-        x      : (B, 3, H, W)       low-res RGB
-        depth  : (B, 1, H, W)       optional depth
-        motion : (B, 2, H, W)       optional motion vectors in NORMALIZED coords
-        jitter : (B, 2) or (B, 2, 1, 1), currently unused here directly but
-                 may have been applied when creating 'motion' in the dataloader.
-
-        Returns:
-          y_hr : (B, 3, H*sf, W*sf) high-res RGB
-        """
-
-        B, C, H, W = x.shape
-        sf = self.upscale_factor
-
-        # --------------------------------------------------------------
-        # Move inputs to space-to-depth domain
-        # --------------------------------------------------------------
-        # (B, 3, H, W) -> (B, 3*sf^2, H/sf, W/sf)
-        x_s2d = self.s2d(x)
-
-        depth_s2d = None
-        motion_s2d_for_concat = None
-
-        if self.use_depth and depth is not None:
-            depth_s2d = self.s2d(depth)
-
-        if self.use_motion and motion is not None:
-            # For concatenation, we also put motion into S2D domain.
-            # Note: this is separate from the version resized in _warp_hidden,
-            # which uses bilinear resize to match hidden resolution precisely.
-            motion_s2d_for_concat = self.s2d(motion)
-
-        # --------------------------------------------------------------
-        # Build encoder input
-        # --------------------------------------------------------------
-        inputs = [x_s2d]
-
-        if depth_s2d is not None:
-            inputs.append(depth_s2d)
-        if motion_s2d_for_concat is not None:
-            inputs.append(motion_s2d_for_concat)
-
-        # Warp recurrent hidden state (S2D resolution) using normalized motion
-        if self.use_prev_state and motion is not None:
-            warped_hidden = self._warp_hidden(motion)
-        else:
-            warped_hidden = None
-
-        if self.use_prev_state:
-            if warped_hidden is None:
-                warped_hidden = torch.zeros(
-                    (B, self.hidden_channels, x_s2d.shape[2], x_s2d.shape[3]),
-                    device=x.device,
-                    dtype=x.dtype,
-                )
-            inputs.append(warped_hidden)
-
-        x_in = torch.cat(inputs, dim=1)
-
-        # --------------------------------------------------------------
-        # Encoder
-        # --------------------------------------------------------------
-        e1 = self.enc1(x_in)                           # H/sf,     W/sf
-        e2 = self.enc2(F.avg_pool2d(e1, 2))            # H/(2sf),  W/(2sf)
-        e3 = self.enc3(F.avg_pool2d(e2, 2))            # H/(4sf),  W/(4sf)
-
-        # --------------------------------------------------------------
-        # Bottleneck
-        # --------------------------------------------------------------
-        b = self.bottleneck(e3)
-
-        # Update recurrent hidden state (S2D resolution)
-        if self.use_prev_state:
-            # Upsample b to encoder stage-1 resolution (H/sf, W/sf)
-            h = F.interpolate(
-                b,
-                size=e1.shape[-2:],
-                mode="bilinear",
-                align_corners=True,  # keep consistent with warp/grid_sample usage
-            )
-            self._hidden_state = self.to_hidden(h)
-
-        # --------------------------------------------------------------
-        # Decoder (UNet-style)
-        # --------------------------------------------------------------
-        d3 = F.interpolate(b, scale_factor=2, mode="bilinear", align_corners=True)
-        d3 = self.dec3(torch.cat([d3, e3], dim=1))
-
-        d2 = F.interpolate(d3, scale_factor=2, mode="bilinear", align_corners=True)
-        d2 = self.dec2(torch.cat([d2, e2], dim=1))
-
-        d1 = F.interpolate(d2, scale_factor=2, mode="bilinear", align_corners=True)
-        d1 = self.dec1(torch.cat([d1, e1], dim=1))
-
-        # --------------------------------------------------------------
-        # Project back to RGB via DepthToSpace
-        # --------------------------------------------------------------
-        out_s2d = self.to_out(d1)          # (B, 3*sf^2, H/sf, W/sf)
-        y_hr = self.d2s(out_s2d)           # (B, 3, H*sf, W*sf)
-
-        return y_hr
+import cv2 as cv
+import numpy as np
+import json
+from .base_model import BaseModel
+from .space_to_depth import DepthToSpace, SpaceToDepth
+from .kernel_prediction import KernelPrediction
+from .utils import warp, retrieve_elements_from_indices, get_unique_filename
 
 
 class Warping(BaseModel):
-    def __init__(self, scale_factor: int, depth_block_size: int = 3) -> None:
-        assert depth_block_size % 2 == 1 # They used 8x8 but I can't use even kernels yet
+    def __init__(self, scale_factor: int = 2, jitter: bool = False, depth_dilation: bool = False, depth_block_size: int = 7) -> None:
+        assert depth_block_size % 2 == 1
         super().__init__()
-        self.space_to_depth = SpaceToDepth(block_size=scale_factor)
+        self.space_to_depth = SpaceToDepth(scale_factor=scale_factor)
         self.max_pool = nn.MaxPool2d(kernel_size=depth_block_size, stride=1, padding=depth_block_size // 2, return_indices=True)
+        self.upsample = nn.Upsample(scale_factor=scale_factor, mode='bilinear', align_corners=True)
+
+        self.jitter_on = jitter
+        self.depth_dilation = depth_dilation
 
     def forward(self, 
                 depth: torch.Tensor, 
@@ -286,37 +29,151 @@ class Warping(BaseModel):
                 prev_jitter: torch.Tensor,
                 motion: torch.Tensor, 
                 prev_features: torch.Tensor, 
-                prev_color: torch.Tensor) -> torch.Tensor:
+                prev_color: torch.Tensor,
+                device,
+                high_res = False) -> torch.Tensor:
         """
-        motion: B, 2, H, W
-        depth: B, 1, H, W
+        motion: B, 2, h, w
+        depth: B, 1, h, w
         jitter: B, 2, 1, 1
         prev_jitter: B, 2, 1, 1
             assumed that jitter is in relative coordinates 
             (i.e. -1 to 1, -1 is the whole image left, 1 is the whole image right)
         prev_features: B, 1, H, W
         prev_color: B, 3, H, W
-
-        Note:
-            H, W are target resolutions
-            it is assumed that depth and motion are upsampled prior
         """
 
-        # Jitter compensation for motion
-        motion[:, 0] = motion[:, 0] + prev_jitter[:, 0] - jitter[:, 0] # x
-        motion[:, 1] = motion[:, 1] + prev_jitter[:, 1] - jitter[:, 1] # y
+        _, _, h, w = motion.shape
 
-        # Depth informed dilation
-        # Get indices of closest pixels and use those motion vectors
-        _, indices = self.max_pool(depth)
-        motion = retrieve_elements_from_indices(motion, indices)
-
+        if self.jitter_on:
+            motion[:, 0] = motion[:, 0] + (-prev_jitter[:, 0] + jitter[:, 0]) / w
+            motion[:, 1] = motion[:, 1] + (-prev_jitter[:, 1] + jitter[:, 1]) / h
+        
+        if self.depth_dilation:
+            _, indices = self.max_pool(depth)
+            motion = retrieve_elements_from_indices(motion, indices)
+        
         # Warp previous features and color
         prev_features = warp(prev_features, motion)
-        prev_color = warp(prev_color, motion)
+        prev_color = warp(prev_color, motion) # [batch, 3, H, W]
 
-        # Transform to input resolution
+        if high_res:
+            return prev_features, prev_color # B, 3, H, W
+
         prev_features = self.space_to_depth(prev_features)
-        prev_color = self.space_to_depth(prev_color)
+        prev_color = self.space_to_depth(prev_color) # B, 12, h, w
 
         return prev_features, prev_color
+
+class Reconstruction(BaseModel):
+    """
+    reconstruction network for neural network module
+    """
+    def __init__(self, f: int, m: int, jitter: bool, jitter_conv: bool, jitter_conv_channels: int, scale_factor: int = 2):
+        super().__init__()
+
+        if jitter_conv:
+            self.enc_kernel_predictor = KernelPrediction(layers=7, hidden_features=2048, kernel_size=3, num_kernel=1)
+            self.dec_kernel_predictor = KernelPrediction(layers=7, hidden_features=2048, kernel_size=3, num_kernel=3)
+
+        if jitter:
+            self.encoder = nn.Sequential(nn.Conv2d(22, f, 3, 1, 1), nn.ReLU())
+            self.decoder = nn.Conv2d(f, 17, 3, 1, 1)
+        else:
+            self.encoder = nn.Sequential(nn.Conv2d(20, f, 3, 1, 1), nn.ReLU())
+            self.decoder = nn.Conv2d(f, 17, 3, 1, 1)
+        
+        self.net = nn.Sequential(
+            *[nn.Sequential(nn.Conv2d(f, f, 3, 1, 1), nn.ReLU()) for _ in range(m)],
+        )
+
+        self.relu = nn.ReLU()
+        self.sigmoid = nn.Sigmoid()
+        self.depth_to_space = DepthToSpace(scale_factor=scale_factor)
+
+        self.jitter_on = jitter
+        self.jitter_conv_on = jitter_conv
+        self.jitter_conv_channels = 4 # only color LR and depth LR will do jitter conv
+
+
+    def forward(self, 
+                color: torch.Tensor, # [B, 3, h, w]
+                depth: torch.Tensor, # [B, 1, h, w]
+                jitter: torch.Tensor, # [B, 2, 1, 1]
+                prev_features: torch.Tensor, # [B, 4, h, w]
+                prev_color: torch.Tensor, # [B, 12, h, w]
+                ):
+        B, _, h, w = color.shape
+        jitter_ = torch.zeros_like(jitter)
+
+        if self.jitter_on:
+            jitter_[:, 0, :, :] = jitter[:, 0, :, :] / w
+            jitter_[:, 1, :, :] = jitter[:, 1, :, :] / h
+            jitter_ = jitter_.repeat(1, 1, h, w) # (B, 2, h, w)
+
+            x = torch.cat([color, depth, prev_features, prev_color, jitter_], dim=1)
+        else:
+            x = torch.cat([color, depth, prev_features, prev_color], dim=1)
+
+
+        if self.jitter_conv_on:
+            enc_kernel = self.enc_kernel_predictor(jitter) # [B, 1, 3, 3]
+            dec_kernel = self.dec_kernel_predictor(jitter) # [B, 3, 3, 3]
+            enc_kernel = enc_kernel.repeat(1, self.jitter_conv_channels, 1, 1).view(B*self.jitter_conv_channels, 1, 3, 3)
+
+            x_input = x[:, :self.jitter_conv_channels].reshape(1, B*self.jitter_conv_channels, h, w)
+            x_output = F.conv2d(x_input, enc_kernel, padding=1, groups=B*self.jitter_conv_channels)
+            x = torch.cat([x_output.reshape(B, self.jitter_conv_channels, h, w), x[:, self.jitter_conv_channels:]], dim=1)
+
+        x = self.encoder(x)
+        x = self.net(x)
+        x = self.decoder(x)
+
+        if self.jitter_conv_on:
+            features = F.conv2d(
+                x[:, :4].reshape(1, B*4, h, w), 
+                dec_kernel[:, 0:1].repeat(1, 4, 1, 1).reshape(B*4, 1, 3, 3), 
+                padding=1, groups=B*4,
+            ).reshape(B, 4, h, w)
+            blending_mask = self.sigmoid(F.conv2d(
+                x[:, 4:5].reshape(1, B*1, h, w),
+                dec_kernel[:, 1:2], 
+                padding=1, groups=B*1,
+            )).reshape(B, 1, h, w)
+            current_frame = self.relu(F.conv2d(
+                x[:, 5:].reshape(1, B*12, h, w), 
+                dec_kernel[:, 2:3].repeat(1, 12, 1, 1).reshape(B*12, 1, 3, 3), 
+                padding=1, groups=B*12,
+            )).reshape(B, 12, h, w)
+        else:
+            features = x[:, :4]
+            blending_mask = self.sigmoid(x[:, 4:5])
+            current_frame = self.relu(x[:, 5:])
+
+        features = self.depth_to_space(features)
+        color = self.depth_to_space(blending_mask * current_frame + (1 - blending_mask) * prev_color)
+        
+        return features, color, blending_mask
+
+
+class Model(BaseModel):
+    def __init__(self, f: int, m: int, jitter: bool, jitter_conv: bool, jitter_conv_channels: int, depth_dilation: bool, scale_factor: int=2, depth_block_size: int=7):
+    super().__init__()
+
+    self.warping = Warping(scale_factor, jitter, depth_dilation, depth_block_size)
+    self.network = Reconstruction(f, m, jitter, jitter_conv, jitter_conv_channels)
+
+    def forward(self, 
+                color: torch.Tensor, # [B, 3, h, w]
+                depth: torch.Tensor, # [B, 1, h, w]
+                jitter: torch.Tensor, # [B, 2, 1, 1]
+                prev_jitter: torch.Tensor, # [B, 2, 1, 1]
+                motion: torch.Tensor, # [B, 2, h, w]
+                prev_features: torch.Tensor, # [B, 1, H, W]
+                prev_color: torch.Tensor, # [B, 3, H, W]
+                device
+    ):
+
+        warped_features, warped_color = self.warping(depth, jitter, prev_jitter, motion, prev_features, prev_color, device)
+        features, color, blending_mask = self.network(color, depth, jitter, warped_features, warped_color)
+        return color, features, blending_mask
