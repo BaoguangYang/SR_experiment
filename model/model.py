@@ -6,13 +6,68 @@ import torch.nn.functional as F
 import cv2 as cv
 import numpy as np
 import json
-from .base_model import BaseModel
 from .space_to_depth import DepthToSpace, SpaceToDepth
-from .kernel_prediction import KernelPrediction
-from .utils import warp, retrieve_elements_from_indices, get_unique_filename
 
 
-class Warping(BaseModel):
+def retrieve_elements_from_indices(tensor: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+    _, iC, _, _ = indices.shape
+    B, C, H, W = tensor.shape
+    indices = indices.flatten(start_dim=1).view(B, 1, -1)
+    tensor = tensor.flatten(start_dim=2)
+
+    indices = indices.repeat(1, C, 1) 
+
+    tensor = tensor.gather(dim=2, index=indices).view(B, C, H, W)
+    return tensor 
+
+
+def warp(image: torch.Tensor, motion: torch.Tensor) -> torch.Tensor:
+    """
+    image: (B, C, H, W) - High resolution image
+    motion: (B, 2, h, w) - Low resolution motion vectors
+    """
+
+    B, C, H, W = image.shape
+    _, _, h, w = motion.shape
+    device = image.device
+    # Step 1: Bilinear upsample motion vector to match image resolution
+    # motion_up = F.interpolate(motion, size=(H, W), mode='bilinear', align_corners=True)
+    motion_up = F.interpolate(motion, size=(H, W), mode='nearest')
+
+    # Step 2: Build pixel coordinate grid
+    yy, xx = torch.meshgrid(
+        torch.arange(H, device=device),
+        torch.arange(W, device=device),
+        indexing='ij'
+    )  # (H, W)
+
+    xx = xx.unsqueeze(0).expand(B, -1, -1).float()  # (B, H, W)
+    yy = yy.unsqueeze(0).expand(B, -1, -1).float()  # (B, H, W)
+
+    # Step 3: Apply motion to pixel positions
+    # Note: HLSL uses (-mv.x, mv.y) convention
+    new_x = xx + (-motion_up[:, 0] * W)
+    new_y = yy + ( motion_up[:, 1] * H)
+
+    # Step 4: Normalize coordinates to [-1, 1] for grid_sample
+    new_x = (2.0 * new_x / (W - 1)) - 1.0
+    new_y = (2.0 * new_y / (H - 1)) - 1.0
+
+    grid = torch.stack((new_x, new_y), dim=-1)  # (B, H, W, 2)
+
+    # Step 5: Bilinear sample image at warped positions
+    warped = F.grid_sample(
+        image,
+        grid,
+        mode='bilinear',
+        padding_mode='border',  # border padding like SampleLevel usually does
+        align_corners=True
+    )
+    return warped 
+
+
+
+class Warping(nn.Module):
     def __init__(self, scale_factor: int = 2, jitter: bool = False, depth_dilation: bool = False, depth_block_size: int = 7) -> None:
         assert depth_block_size % 2 == 1
         super().__init__()
@@ -65,16 +120,13 @@ class Warping(BaseModel):
 
         return prev_features, prev_color
 
-class Reconstruction(BaseModel):
+
+class Reconstruction(nn.Module):
     """
     reconstruction network for neural network module
     """
-    def __init__(self, f: int, m: int, jitter: bool, jitter_conv: bool, jitter_conv_channels: int, scale_factor: int = 2):
+    def __init__(self, f: int, m: int, jitter: bool, scale_factor: int = 2):
         super().__init__()
-
-        if jitter_conv:
-            self.enc_kernel_predictor = KernelPrediction(layers=7, hidden_features=2048, kernel_size=3, num_kernel=1)
-            self.dec_kernel_predictor = KernelPrediction(layers=7, hidden_features=2048, kernel_size=3, num_kernel=3)
 
         if jitter:
             self.encoder = nn.Sequential(nn.Conv2d(22, f, 3, 1, 1), nn.ReLU())
@@ -92,8 +144,6 @@ class Reconstruction(BaseModel):
         self.depth_to_space = DepthToSpace(scale_factor=scale_factor)
 
         self.jitter_on = jitter
-        self.jitter_conv_on = jitter_conv
-        self.jitter_conv_channels = 4 # only color LR and depth LR will do jitter conv
 
 
     def forward(self, 
@@ -115,40 +165,13 @@ class Reconstruction(BaseModel):
         else:
             x = torch.cat([color, depth, prev_features, prev_color], dim=1)
 
-
-        if self.jitter_conv_on:
-            enc_kernel = self.enc_kernel_predictor(jitter) # [B, 1, 3, 3]
-            dec_kernel = self.dec_kernel_predictor(jitter) # [B, 3, 3, 3]
-            enc_kernel = enc_kernel.repeat(1, self.jitter_conv_channels, 1, 1).view(B*self.jitter_conv_channels, 1, 3, 3)
-
-            x_input = x[:, :self.jitter_conv_channels].reshape(1, B*self.jitter_conv_channels, h, w)
-            x_output = F.conv2d(x_input, enc_kernel, padding=1, groups=B*self.jitter_conv_channels)
-            x = torch.cat([x_output.reshape(B, self.jitter_conv_channels, h, w), x[:, self.jitter_conv_channels:]], dim=1)
-
         x = self.encoder(x)
         x = self.net(x)
         x = self.decoder(x)
 
-        if self.jitter_conv_on:
-            features = F.conv2d(
-                x[:, :4].reshape(1, B*4, h, w), 
-                dec_kernel[:, 0:1].repeat(1, 4, 1, 1).reshape(B*4, 1, 3, 3), 
-                padding=1, groups=B*4,
-            ).reshape(B, 4, h, w)
-            blending_mask = self.sigmoid(F.conv2d(
-                x[:, 4:5].reshape(1, B*1, h, w),
-                dec_kernel[:, 1:2], 
-                padding=1, groups=B*1,
-            )).reshape(B, 1, h, w)
-            current_frame = self.relu(F.conv2d(
-                x[:, 5:].reshape(1, B*12, h, w), 
-                dec_kernel[:, 2:3].repeat(1, 12, 1, 1).reshape(B*12, 1, 3, 3), 
-                padding=1, groups=B*12,
-            )).reshape(B, 12, h, w)
-        else:
-            features = x[:, :4]
-            blending_mask = self.sigmoid(x[:, 4:5])
-            current_frame = self.relu(x[:, 5:])
+        features = x[:, :4]
+        blending_mask = self.sigmoid(x[:, 4:5])
+        current_frame = self.relu(x[:, 5:])
 
         features = self.depth_to_space(features)
         color = self.depth_to_space(blending_mask * current_frame + (1 - blending_mask) * prev_color)
@@ -156,12 +179,12 @@ class Reconstruction(BaseModel):
         return features, color, blending_mask
 
 
-class Model(BaseModel):
-    def __init__(self, f: int, m: int, jitter: bool, jitter_conv: bool, jitter_conv_channels: int, depth_dilation: bool, scale_factor: int=2, depth_block_size: int=7):
+class Model(nn.Module):
+    def __init__(self, f: int, m: int, jitter: bool, depth_dilation: bool, scale_factor: int=2, depth_block_size: int=7):
     super().__init__()
 
     self.warping = Warping(scale_factor, jitter, depth_dilation, depth_block_size)
-    self.network = Reconstruction(f, m, jitter, jitter_conv, jitter_conv_channels)
+    self.network = Reconstruction(f, m, jitter)
 
     def forward(self, 
                 color: torch.Tensor, # [B, 3, h, w]

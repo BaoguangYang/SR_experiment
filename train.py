@@ -32,8 +32,6 @@ def train(dataLoaderIns, valDataLoaderIns, model=None, finetune=False):
         model = Model(f=configs.f, 
                     m=configs.m, 
                     jitter=configs.jittering, 
-                    jitter_conv=configs.jitter_conv,
-                    jitter_conv_channels=configs.jitter_conv_channels,
                     depth_dilation=configs.depth_dilation).to(device)
 
     if configs.TRANSFER_LEARN:
